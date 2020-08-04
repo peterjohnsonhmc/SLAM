@@ -6,9 +6,10 @@ Description:
     fastSLAM 1.0 implementation based on algorithm in Probabalistic Robotics
     by Sebastian Thrun et al. Dataset is from E205 State Estimation Course
     There is a single landmark, a post in an open field
-    State to be estimated is x, y, theta, with a single landmark
-    Rao-Blackwellized Particle filter is used. PF for estimating path and EKF
-    for estimating landmark location. This implementation will use known correspondence
+    State to be estimated is pose (x, y, theta)
+    Rao-Blackwellized Particle filter is used. PF for estimating pose and 
+    each particle has an EKF for estimating landmark location. This 
+    implementation will use known landmark correspondence
 """
 
 import csv
@@ -19,24 +20,37 @@ import numpy as np
 import math
 import os.path
 import scipy as sp
-from scipy.stats import norm, uniform
+from scipy.stats import norm, uniform multivariate_normal
 from numpy import linalg as la
 from statistics import stdev
 from fastSLAM_particle import Particle
 
 
-HEIGHT_THRESHOLD = 0.0          	# meters
-GROUND_HEIGHT_THRESHOLD = -.4       # meters
-dt = 0.1                        	# timestep seconds
-X_L = 5.                          	# Landmark position in global frame
-Y_L = -5.                          	# meters
-EARTH_RADIUS = 6.3781E6         	# meters
-NUM_PARTICLES = 100					# 100 isnt quite good enough
+HEIGHT_THRESHOLD = 0.0                  # meters
+GROUND_HEIGHT_THRESHOLD = -.4           # meters
+dt = 0.1                                # timestep seconds
+X_L = 5.                                # Landmark position in global frame
+Y_L = -5.                               # meters
+EARTH_RADIUS = 6.3781E6                 # meters
+NUM_PARTICLES = 100                                     # 100 isnt quite good enough
 # variances obtained from previous work with Accelerometer and LiDAR
 VAR_AX = 1.8373
 VAR_AY = 1.1991
 VAR_THETA = 0.00058709
 VAR_LIDAR = 0.0075**2 # this is actually range but works for x and y
+# Covariance matrices to be computed once, ahead of tie
+Q_t = np.array([[VAR_LIDAR, 0]
+               [0,  VAR_LIDAR]],dtype=np.double)
+H = np.array([[ -1, 0,  0],
+              [  0, -1, 0]],dtype = float)
+
+H_T = np.transpose(H)
+
+H_inv = np.linalg.inv(H)
+H_inv_T = np.transpose(H_inv)
+feat_init_cov = H_inv.dot(Q_t).dot(H_inv_T)
+# Default importance weight
+p0 = 1/NUM_PARTICLES
 
 PRINTING = False
 
@@ -123,7 +137,6 @@ def filter_data(data):
     Returns:
     filtered_data (dict)    -- filtered data
     """
-
     # Remove data that is not above a height threshold to remove
     # ground measurements and remove data below a certain height
     # to remove outliers like random birds in the Linde Field (fuck you birds)
@@ -180,20 +193,21 @@ def wrap_to_pi(angle):
 
 def propogate_state(p_i_t, u_t):
     """Propogate/predict the state based on chosen motion model
-        Use the nonlinear function g(x_t_prev, u_t)
+        Use the nonlinear function g(x_t_prev, u_t) to sample from distribution
         Assign a random velocity from bimodal distribution
         Either centered around 0 or the average speed
         This motion model forgoes the need for odometry
 
-    Parameters:
-    p_i_t (np.array)  	 -- the particle to be propagated 
-    u_t (np.array)       -- the current control input (really is odometry)
+        Parameters:
+        p_i_t (particle)     -- the particle to be propagated 
+        u_t (np.array)       -- the current control input (really is odometry)
 
-    Returns:
-    p_pred_t (np.array)  -- the predicted particle
+        Returns:
+        p_i_t (particle)  -- the predicted particle
     """
     #Destructure arrays
-    xd, x, yd, y, theta, w = p_i_t
+    x, y, theta = p_i_t.state
+    #w = p_i_t.weight
     ux, uy, yaw = u_t
 
     # print("V: ", V  )
@@ -209,29 +223,44 @@ def propogate_state(p_i_t, u_t):
     # print("Vx: ", Vx)
     # print("Vy: ", Vy)
 
-    p_pred_t = np.array([[Vx],
-                         [x  +  xd*dt],
-                         [Vy],
-                         [y  +  yd*dt],
-                         [yaw],
-                         [w]], dtype = np.double)
+    p_i_t.updateState(x+Vx*dt,y+Vy*dt,yaw)
     #print("x_bar_t: ", x_bar_t.shape)
 
-    return p_pred_t
+    return p_i_t
+
+def calc_inverse_Sensor(p_i_t,z_t):
+    """Calculate the location of a feature given the measurment
+        and the pose
+        Parameters:
+        z_t (np.array)  --measurment
+        x_t (np.array)  --pose
+
+        Returns:
+        mu_t(np.array) --the landmark location
+    """
+
+    x, y, theta = p_i_t.state
+    z_x, z_y = z_t
+
+    mu_t = np.array([x+z_x,
+                     y+z_y],
+                    dtype = np.double)
+    return mu_t
+
 
 def calc_meas_prediction(p_i_t):
     """Calculate predicted measurement based on the predicted state
         Implements the nonlinear measrument h function
         Parameters:
-        p_i_t (np.array)  -- the predicted particle
+        p_i_t (particle)  -- the predicted particle
 
         Returns:
         z_bar_t (np.array)  -- the predicted measurement (x and y range)
     """
-    xd, x, yd, y, theta, w = p_i_t
+    x, y, theta = p_i_t.state
 
-    z_bar_t = np.array([X_L-x,
-                        Y_L-y],
+    z_bar_t = np.array([p_i_t.feat[1]-x,
+                        p_i_t.feat[2]-y],
                         dtype = np.double)
 
     #print("z_bar_t: ", z_bar_t.shape)
@@ -239,55 +268,20 @@ def calc_meas_prediction(p_i_t):
 
     return z_bar_t
 
-def longpdf(mu, var, x):
-	"""Implement a probability density function for a gaussian distribution
-		Parameters:
-		mu  (np.longdouble)	-- the average of the distribution
-		var (np.longdouble)	-- the variance of the distribution
-		x   (np.longdouble) -- the sample value to evaluate the pdf at
+def multipdf(mu, var, x):
+    """Implement a probability density function for a gaussian distribution
+        Parameters:
+        mu  (np.longdouble)     -- the average of the distribution
+        var (np.longdouble)     -- the variance of the distribution
+        x   (np.longdouble) -- the sample value to evaluate the pdf at
 
-		Returns:
-		pdf (np.longdouble) -- the relative likelihood of the sample val
-		"""
-    const = sp.longdouble(1.0/np.sqrt(2*math.pi*var))
+        Returns:
+        pdf (np.longdouble) -- the relative likelihood of the sample val
+    """
+    const = sp.longdouble(1.0/np.sqrt(2*math.pi.dot(var)))
     exponent = sp.longdouble(-0.5*((x-mu)**2)/var)
     return sp.longdouble(const*np.exp(exponent))
 
-def find_weight(p_i_t, z_t, u_t, var_lidar, var_theta):
-    z_x, z_y = z_t
-    _, _, u_theta = u_t
-
-    z_bar_x, z_bar_y = calc_meas_prediction(p_i_t)
-    #_, _, _, _, _, theta, _, _ = p_i_t
-    xd, x, yd, y, theta, w = p_i_t
-
-    if (PRINTING):
-        print("z_x: ", z_x)
-        print("z_y: ", z_y)
-        print("z_bar_x: ", z_bar_x)
-        print("z_bar_y: ", z_bar_y)
-
-    pdf_val_x = longpdf(z_bar_x, var_lidar, z_x)
-    w_xt = sp.longdouble(pdf_val)
-
-    pdf_val_y = longpdf(z_bar_y, var_lidar, z_y)
-    w_yt = sp.longdouble(pdf_val)
-
-    pdf_val = longpdf(u_theta, VAR_THETA, theta)
-    w_theta = sp.longdouble(pdf_val)
-
-    if (PRINTING):
-        print("w_yt: ", w_yt)
-        print("w_xt: ", w_xt)
-
-    if (w_yt == 0.0):
-        w_yt = 10e-80
-    if (w_xt == 0.0):
-        w_xt = 10e-80
-    if (w_theta == 0.0):
-        w_theta = 10e-80
-
-    return sp.longdouble(w_xt*w_yt*w_theta)
 
 def local_to_global(p_i_t, z_t):
     """Rotate the lidar x and y measurements from the lidar frame to the global frame orientation
@@ -300,7 +294,8 @@ def local_to_global(p_i_t, z_t):
        z_global (np.array) -- global orientation measurment vector
     """
     #xd, x, yd, y, thetad, theta, thetap, w = p_i_t
-    xd, x, yd, y, theta, w = p_i_t
+    x, y, theta = p_i_t.state
+    w = p_i_t.weight
     zx, zy = z_t
     w_theta = wrap_to_pi(-theta+math.pi/2)
 
@@ -310,49 +305,58 @@ def local_to_global(p_i_t, z_t):
 
     return z_global
 
-
-
 def prediction_step(P_prev, u_t, z_t):
     """Compute the prediction half of particle filter
 
     Parameters:
-    P_prev (list of np.arrays)  -- set of previous particles
+    P_prev (list of particles)  -- set of previous particles
     u_t (np.array)              -- the control input
     z_t (np.array)              -- the measurement
 
     Returns:
-    P_pred                      -- the set of predicted particles
+    P_pred  (list of particles) -- the set of predicted particles
+    w_tot   (float)             -- the total weight of all the particles    
     """
-
+    c_t = 1     # a made up correspondence variable 
     P_pred = []
     w_tot = 0
-    var_lidar = VAR_LIDAR
-    var_theta = VAR_THETA
+
     # loop over all of the previous particles
     for p_prev in P_prev:
         # find new state given previous particle, odometry + randomness (motion model)
         p_pred = propogate_state(p_prev, u_t)
-        # Globalize the measurment for each particle
-        z_g_t = local_to_global(p_pred, z_t)
+        
+        # Mapping with observed feature
+        if(p_pred.observed):
+            # Globalize the measurment for each particle
+            z_g_t = local_to_global(p_pred, z_t)
+            # measurement prediction
+            z_bar_t = calc_meas_prediction(p_pred)
+            # measurment covariance
+            Q = H.dot(p_pred.covs).dot(H_T)+Q_t
+            Q_inv = np.linalg.inv(Q)
+            # Kalman gain
+            K = p_pred.covs.dot(H_T).dot(Q_inv)
+            # update mean
+            mu = p_pred.feats[1:2]+K.dot(z_g_t-z_bar_t)
+            # update covariance
+            cov = (np.identity(2)-K.dot(H)).dot(p_pred.cov)
+            # importance factor
+            importance = multivariate_normal(z_bar_t,cov)
+            weight = importance.pdf(z_g_t)
+            p_pred.updateFeat(mu, cov, weight)
+
+        else: # Never seen before
+            mu = inverseSensor(p_pred,z_t)
+            p_pred.initFeat(C_t, mu, feat_init_cov,p0) 
+
+        
         # find particle's weight using wt = P(zt | xt)
-        w_t = find_weight(p_pred, z_g_t, u_t, var_lidar, var_theta)
+        w_t = p_pred.weight
         w_tot += w_t
         # add new particle to the current belief
-        p_pred[5] = w_t
-        p_pred.reshape((6,))
+        p_pred.weight = w_t
         P_pred.append(p_pred)
-
-    while (w_tot <= NUM_PARTICLES*10e-20):
-        w_tot = 0
-        var_lidar *= 100
-        var_theta *= 100
-        for i in range(0, NUM_PARTICLES):
-            p_pred = P_pred[i]
-            z_g_t = local_to_global(p_pred, z_t)
-            w_t = find_weight(p_pred, z_g_t, u_t, var_lidar, var_theta)
-            w_tot += w_t
-            p_pred[5] = w_t
-            P_pred[i] = p_pred
 
     return [P_pred, w_tot]
 
@@ -360,7 +364,7 @@ def prediction_step(P_prev, u_t, z_t):
 
 def correction_step(P_pred, w_tot):
     """Compute the correction portion of particle filter
-    	Resample based on the weights of the particles
+        Resample based on the weights of the particles
 
     Parameters:
     P_pred    (list of np.array)  -- the predicted particles of time t
@@ -377,7 +381,7 @@ def correction_step(P_pred, w_tot):
     P_corr = []
 
     p0 = P_pred[0]
-    w0 = p0[5].copy() #Need to make a deep copy
+    w0 = p0.weight 
     # resampling algorithm
     for p in P_pred:
         r = np.random.uniform(0, 1)*w_tot
@@ -388,11 +392,10 @@ def correction_step(P_pred, w_tot):
             if (j == NUM_PARTICLES-1):
                 break
             p_j = P_pred[j]
-            w_j = p_j[5].copy()
+            w_j = p_j.weight
             wsum += w_j
 
         p_c = P_pred[j]
-        p_c.reshape((6,))
         #print(p_c)
         P_corr.append(p_c)
 
@@ -400,84 +403,36 @@ def correction_step(P_pred, w_tot):
 
 
 def distance(x1,y1,x2,y2):
-	"""Compute the distance between two points
-		Parameters:
-		x1 (float)	--x coordinate of first point
-		y1 (float)	--y coordinate of first point
-		x2 (float)	--x coordinate of second point
-		y2 (float)	--y coordinate of second point
+    """Compute the distance between two points
+            Parameters:
+            x1 (float)      --x coordinate of first point
+            y1 (float)      --y coordinate of first point
+            x2 (float)      --x coordinate of second point
+            y2 (float)      --y coordinate of second point
 
-		Returns:
-		dist (float)	--euclidean distance
-	"""
-     dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-     return dist
+            Returns:
+            dist (float)    --euclidean distance
+    """
+    dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    return dist
 
 def simple_clustering(P_t):
-	""" O(N) Clustering algorithm to find highest weighted particle
-		as the centroid of a single cluster. Picks state to be plotted
-		Parameters:
-		P_t (array)	--the set of particles
+    """ O(N) Clustering algorithm to find highest weighted particle
+            as the centroid of a single cluster. Picks state to be plotted
+            Parameters:
+            P_t (array)     --the set of particles
 
-		Returns:
-		best_particle (np.array)	--the highest weighted particle 
-	"""
+            Returns:
+            best_particle (np.array)        --the highest weighted particle 
+    """
     highest_weight = 0;
     best_particle = P_t[0];
     for p in P_t:
-        if p[5] > highest_weight:
-            highest_weight = p[5]
+        if p.weight > highest_weight:
+            highest_weight = p.weight
             best_particle = p
     return best_particle
 
-def subtractive_clustering(P_t):
-	""" Clustering algorithm to find the centroid of cluster. Picks state 
-		to be plotted
-		Parameters:
-		P_t (array)	--the set of particles
-
-		Returns:
-		best_particle (np.array)	--the centroid
-	"""
-    ra = 3*np.sqrt(VAR_LIDAR) # neighborhood radius based on 99% confidence, which is 3 stdev
-    pot = []
-    maxpot = 0
-    maxindex = 0
-    centroids = []
-    for i in range(0, NUM_PARTICLES):
-        newpot = 0
-        for j in range(0, NUM_PARTICLES):
-            newpot += np.exp(-la.norm(P_t[i]-P_t[j],2)/(0.5*ra)**2)
-        pot.append(newpot)
-        if (newpot > maxpot):
-            maxpot = newpot
-            maxindex = i
-
-    # Define first centroid center c1
-    k = 1
-    ck = P_t[maxindex]
-    return ck
-    potck = pot[maxindex]
-    potlast = 0
-    centroids.append(ck)
-    # while (potck > 0.95*potlast):
-    #     #Update Potential Values
-    #     newpot = 0
-    #     maxpot = 0
-    #     maxindex = 0
-    #     for i in range(0, NUM_PARTICLES):
-    #         pot[i] -= potck*np.exp(-la.norm(P_t[i] - ck,2)/(0.75*ra)**2)
-    #         if (pot[i] > maxpot):
-    #             maxpot = pot[i]
-    #             maxindex = i
-    #     #Calculate kth centroid
-    #     ck = P_t[maxindex]
-    #     potlast = potck
-    #     potck = pot[maxindex]
-    #     centroids.append(ck)
-    #     k = k + 1
-
-    return centroids[0:-1]
 
 def path_rmse(state_estimates):
     """ Computes the RMSE error of the distance at each time step from the expected path
@@ -602,15 +557,15 @@ def main():
         randy = np.random.uniform(-15,5)
         randtheta = np.random.uniform(-math.pi,math.pi)
         # Start in random location
-        p = np.array([randx, randy, randtheta, 1/NUM_PARTICLES], dtype = np.double)
+        p = Particle(randx, randy, randtheta, 1/NUM_PARTICLES)
         # Start in the NW corner
-        #p = np.array([0, 0, 0, 0, 0, 0, 0, 1/NUM_PARTICLES], dtype = np.double) # known start
-        p.reshape((6,))
+        #p = Particle(0,0,0,1/NUM_PARTICLES)
         P_prev_t.append(p)
 
     #allocate
     gps_estimates = np.empty((2, len(time_stamps)))
-    centroids_logged = np.empty((6, len(time_stamps)))
+    centroids_logged = np.empty((3, len(time_stamps)))
+    wt_logged = np.empty((len(time_stamps)))
 
     #Expected path
     pathx = [0,10,10,0,0]
@@ -636,15 +591,15 @@ def main():
         # plt.axis([-5, 15, -15, 5])
 
         # plt.scatter(x_gps, y_gps, c='b', marker='.')
-        centroids = simple_clustering(P_prev_t)
-        centroids = centroids.reshape((6,))
+        centroid = simple_clustering(P_prev_t)
         # for c in centroids:
         #     plt.scatter(c[1],c[3], c='k', marker='.')
-        centroids_logged[:,t] = centroids
+        centroids_logged[:,t] = centroid.state.reshape((3,))
+        wt_logged[t]=centroid.weight
+        # Print all particles
         if (t % 50 == 1):
             for p in P_prev_t:
-                x = p[1]
-                y = p[3]
+                x,y,_=p.state
                 ax.scatter(x, y, c='r', marker='.')
         # for c in centroids_logged:
         #     plt.scatter(c[1],c[3], c='k', marker='*')
@@ -678,22 +633,21 @@ def main():
 
 
     plt.scatter(gps_estimates[0][:], gps_estimates[1][:], marker='.')
-    plt.plot(centroids_logged[1][:],centroids_logged[3][:], c='k', linestyle='--')
+    plt.plot(centroids_logged[0][:],centroids_logged[1][:], c='k', linestyle='--')
     plt.plot(pathx, pathy)
     plt.legend([ "PF Estimate", "Expected Path", "Particles", "GPS Measurements"], loc="lower center", ncol=2)
     plt.xlabel("Global X (m)")
     plt.ylabel("Global Y (m)")
     plt.show()
 
-    with open('1000particles2.csv', 'w', newline='') as csvfile:
-        fieldnames = ['times', 'xd', 'x', 'yd', 'y', 'theta', 'w']
+    with open('1000particles.csv', 'w', newline='') as csvfile:
+        fieldnames = ['times', 'x','y', 'theta', 'w']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
         writer.writeheader()
         for t, _ in enumerate(time_stamps):
-            writer.writerow({'times': time_stamps[t], 'xd': centroids_logged[0][t], \
-             'x': centroids_logged[1][t], 'yd': centroids_logged[2][t], 'y': centroids_logged[3][t], \
-             'theta': centroids_logged[4][t], 'w': centroids_logged[5][t]})
+            writer.writerow({'times': time_stamps[t], 'x': centroids_logged[0][t], 'y': centroids_logged[1][t], \
+             'theta': centroids_logged[2][t], 'w': wt_logged[t]})
 
     print("Done plotting, exiting")
     return 0
