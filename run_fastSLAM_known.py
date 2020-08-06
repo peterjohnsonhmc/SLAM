@@ -3,13 +3,15 @@ Author: Peter Johnson
 Email: pjohnson@g.hmc.edu
 Date of Creation: 07/31/20
 Description:
-    fastSLAM 1.0 implementation based on algorithm in Probabalistic Robotics
+    FastSLAM 2.0 implementation based on algorithm in Probabalistic Robotics
     by Sebastian Thrun et al. Dataset is from E205 State Estimation Course
     There is a single landmark, a post in an open field
     State to be estimated is pose (x, y, theta)
+    Measurment is landmark range z_x, z_y
     Rao-Blackwellized Particle filter is used. PF for estimating pose and 
     each particle has an EKF for estimating landmark location. This 
-    implementation will use known landmark correspondence
+    implementation will use known landmark correspondence. Goal is to build up 
+    to unknown landmark correspondence
 """
 
 import csv
@@ -20,8 +22,7 @@ import numpy as np
 import math
 import os.path
 import scipy as sp
-from scipy.stats import norm, uniform multivariate_normal
-from numpy import linalg as la
+from scipy.stats import norm, uniform, multivariate_normal
 from statistics import stdev
 from fastSLAM_particle import Particle
 
@@ -29,20 +30,19 @@ from fastSLAM_particle import Particle
 HEIGHT_THRESHOLD = 0.0                  # meters
 GROUND_HEIGHT_THRESHOLD = -.4           # meters
 dt = 0.1                                # timestep seconds
-X_L = 5.                                # Landmark position in global frame
-Y_L = -5.                               # meters
 EARTH_RADIUS = 6.3781E6                 # meters
-NUM_PARTICLES = 100                                     # 100 isnt quite good enough
+NUM_PARTICLES = 1000                                     # 100 isnt quite good enough
 # variances obtained from previous work with Accelerometer and LiDAR
-VAR_AX = 1.8373
-VAR_AY = 1.1991
 VAR_THETA = 0.00058709
 VAR_LIDAR = 0.0075**2 # this is actually range but works for x and y
 # Covariance matrices to be computed once, ahead of tie
-Q_t = np.array([[VAR_LIDAR, 0]
+# Measurment covariance
+Q_t = np.array([[VAR_LIDAR, 0],
                [0,  VAR_LIDAR]],dtype=np.double)
-H = np.array([[ -1, 0,  0],
-              [  0, -1, 0]],dtype = float)
+
+# Measurment covariance reltive to landmark state
+H = np.array([[ -1.0, 0],
+              [  0,-1.0]],dtype = np.double)
 
 H_T = np.transpose(H)
 
@@ -177,12 +177,11 @@ def convert_gps_to_xy(lat_gps, lon_gps, lat_origin, lon_origin):
 
 def wrap_to_pi(angle):
     """Wrap angle data in radians to [-pi, pi]
+        Parameters:
+        angle (np.double)   -- unwrapped angle
 
-    Parameters:
-    angle (np.double)   -- unwrapped angle
-
-    Returns:
-    angle (np.double)   -- wrapped angle
+        Returns:
+        angle (np.double)   -- wrapped angle
     """
     while angle >= math.pi:
         angle -= 2*math.pi
@@ -191,7 +190,7 @@ def wrap_to_pi(angle):
     return angle
 
 
-def propogate_state(p_i_t, u_t):
+def propagate_state(p_i_t, u_t):
     """Propogate/predict the state based on chosen motion model
         Use the nonlinear function g(x_t_prev, u_t) to sample from distribution
         Assign a random velocity from bimodal distribution
@@ -220,11 +219,12 @@ def propogate_state(p_i_t, u_t):
     yaw += np.random.normal(0, np.sqrt(VAR_THETA))
     Vx = Vel*math.cos(yaw)
     Vy = Vel*math.sin(yaw)
-    # print("Vx: ", Vx)
-    # print("Vy: ", Vy)
 
     p_i_t.updateState(x+Vx*dt,y+Vy*dt,yaw)
-    #print("x_bar_t: ", x_bar_t.shape)
+    #print("p_i_t.state: ", p_i_t.state)
+    #print("p_i_t.feats: ", p_i_t.feats)
+    #print("p_i_t.covs: ", p_i_t.covs)
+    #print("p_i_t.weight: ", p_i_t.weight)
 
     return p_i_t
 
@@ -259,28 +259,14 @@ def calc_meas_prediction(p_i_t):
     """
     x, y, theta = p_i_t.state
 
-    z_bar_t = np.array([p_i_t.feat[1]-x,
-                        p_i_t.feat[2]-y],
+    z_bar_t = np.array([p_i_t.feats[1]-x,
+                        p_i_t.feats[2]-y],
                         dtype = np.double)
 
     #print("z_bar_t: ", z_bar_t.shape)
     #print("z_bar_t: ", z_bar_t)
 
     return z_bar_t
-
-def multipdf(mu, var, x):
-    """Implement a probability density function for a gaussian distribution
-        Parameters:
-        mu  (np.longdouble)     -- the average of the distribution
-        var (np.longdouble)     -- the variance of the distribution
-        x   (np.longdouble) -- the sample value to evaluate the pdf at
-
-        Returns:
-        pdf (np.longdouble) -- the relative likelihood of the sample val
-    """
-    const = sp.longdouble(1.0/np.sqrt(2*math.pi.dot(var)))
-    exponent = sp.longdouble(-0.5*((x-mu)**2)/var)
-    return sp.longdouble(const*np.exp(exponent))
 
 
 def local_to_global(p_i_t, z_t):
@@ -293,9 +279,8 @@ def local_to_global(p_i_t, z_t):
        Returns:
        z_global (np.array) -- global orientation measurment vector
     """
-    #xd, x, yd, y, thetad, theta, thetap, w = p_i_t
     x, y, theta = p_i_t.state
-    w = p_i_t.weight
+
     zx, zy = z_t
     w_theta = wrap_to_pi(-theta+math.pi/2)
 
@@ -308,14 +293,14 @@ def local_to_global(p_i_t, z_t):
 def prediction_step(P_prev, u_t, z_t):
     """Compute the prediction half of particle filter
 
-    Parameters:
-    P_prev (list of particles)  -- set of previous particles
-    u_t (np.array)              -- the control input
-    z_t (np.array)              -- the measurement
+        Parameters:
+        P_prev (list of particles)  -- set of previous particles
+        u_t (np.array)              -- the control input
+        z_t (np.array)              -- the measurement
 
-    Returns:
-    P_pred  (list of particles) -- the set of predicted particles
-    w_tot   (float)             -- the total weight of all the particles    
+        Returns:
+        P_pred  (list of particles) -- the set of predicted particles
+        w_tot   (float)             -- the total weight of all the particles    
     """
     c_t = 1     # a made up correspondence variable 
     P_pred = []
@@ -324,12 +309,15 @@ def prediction_step(P_prev, u_t, z_t):
     # loop over all of the previous particles
     for p_prev in P_prev:
         # find new state given previous particle, odometry + randomness (motion model)
-        p_pred = propogate_state(p_prev, u_t)
+        p_pred = propagate_state(p_prev, u_t)
+        #print("propagated")
         
         # Mapping with observed feature
-        if(p_pred.observed):
-            # Globalize the measurment for each particle
-            z_g_t = local_to_global(p_pred, z_t)
+        # Globalize the measurment for each particle
+        z_g_t = local_to_global(p_pred, z_t)
+        if(p_pred.observed(c_t)==True):
+            #print("Previously observed feature")
+            
             # measurement prediction
             z_bar_t = calc_meas_prediction(p_pred)
             # measurment covariance
@@ -344,11 +332,13 @@ def prediction_step(P_prev, u_t, z_t):
             # importance factor
             importance = multivariate_normal(z_bar_t,cov)
             weight = importance.pdf(z_g_t)
-            p_pred.updateFeat(mu, cov, weight)
+            print("Weight: ",weight)
+            p_pred.updateFeat(c_t, mu, cov, weight)
 
         else: # Never seen before
-            mu = inverseSensor(p_pred,z_t)
-            p_pred.initFeat(C_t, mu, feat_init_cov,p0) 
+            #print("New observed feature")
+            mu = calc_inverse_Sensor(p_pred,z_g_t)
+            p_pred.initFeat(c_t, mu, feat_init_cov,p0) 
 
         
         # find particle's weight using wt = P(zt | xt)
@@ -361,17 +351,16 @@ def prediction_step(P_prev, u_t, z_t):
     return [P_pred, w_tot]
 
 
-
 def correction_step(P_pred, w_tot):
     """Compute the correction portion of particle filter
         Resample based on the weights of the particles
 
-    Parameters:
-    P_pred    (list of np.array)  -- the predicted particles of time t
-    w_tot     (np.double)             -- the sum of all the particle weights
+        Parameters:
+        P_pred    (list of np.array)  -- the predicted particles of time t
+        w_tot     (np.double)             -- the sum of all the particle weights
 
-    Returns:
-    P_corr    (list of np.array)  -- the corrected particles of time t
+        Returns:
+        P_corr    (list of np.array)  -- the corrected particles of time t
     """
     if (PRINTING):
         print("RESAMPLING")
@@ -386,7 +375,7 @@ def correction_step(P_pred, w_tot):
     for p in P_pred:
         r = np.random.uniform(0, 1)*w_tot
         j = 0
-        wsum = w0.copy()
+        wsum = w0
         while (wsum < r):
             j += 1
             if (j == NUM_PARTICLES-1):
@@ -423,7 +412,7 @@ def simple_clustering(P_t):
             P_t (array)     --the set of particles
 
             Returns:
-            best_particle (np.array)        --the highest weighted particle 
+            best_particle (particle)        --the highest weighted particle 
     """
     highest_weight = 0;
     best_particle = P_t[0];
@@ -498,18 +487,18 @@ def path_rmse(state_estimates):
 def find_sigma(data_set):
     """Finds the standard deviation, sigma, of a 1D data_set
 
-    Parameters:
-    data_set (list)    -- data set to find the sigma of
+        Parameters:
+        data_set (list)    -- data set to find the sigma of
 
-    Returns:
-    sigma (float)      -- the standard deviation of data_set
+        Returns:
+        sigma (float)      -- the standard deviation of data_set
     """
     mu = np.mean(data_set)
     sigma = stdev(data_set, mu)
     return sigma
 
 def main():
-    """Run FASTslam on logged data from IMU and LiDAR moving in a box formation around a landmark"""
+    """Run FastSLAM on logged data from IMU and LiDAR moving in a box formation around a landmark"""
 
     np.random.seed(28)
 
@@ -547,7 +536,7 @@ def main():
     #Compute avg velocity for use in motion model
     global V
     V = 4*10/(len(time_stamps)*dt)
-    print("V: ", V)
+    #print("V: ", V)
 
 
     #  Initialize filter
@@ -557,9 +546,9 @@ def main():
         randy = np.random.uniform(-15,5)
         randtheta = np.random.uniform(-math.pi,math.pi)
         # Start in random location
-        p = Particle(randx, randy, randtheta, 1/NUM_PARTICLES)
+        #p = Particle(randx, randy, randtheta, p0)
         # Start in the NW corner
-        #p = Particle(0,0,0,1/NUM_PARTICLES)
+        p = Particle(0,0,0,1/NUM_PARTICLES)
         P_prev_t.append(p)
 
     #allocate
@@ -582,13 +571,12 @@ def main():
 
     #  Run filter over data
     for t, _ in enumerate(time_stamps):
+    #for t in range(200):
         print(t)
-        x_gps, y_gps = convert_gps_to_xy(lat_gps=lat_gps[t],
-                                 lon_gps=lon_gps[t],
-                                 lat_origin=lat_origin,
-                                 lon_origin=lon_origin)
-        #plt.axis([-15, 25, -25, 15])
-        # plt.axis([-5, 15, -15, 5])
+        x_gps, y_gps = convert_gps_to_xy(lat_gps[t],lon_gps[t],
+                                        lat_origin,lon_origin)
+        gps_estimates[:,t] = np.array([x_gps, y_gps])
+        
 
         # plt.scatter(x_gps, y_gps, c='b', marker='.')
         centroid = simple_clustering(P_prev_t)
@@ -598,15 +586,13 @@ def main():
         wt_logged[t]=centroid.weight
         # Print all particles
         if (t % 50 == 1):
+            print("State: ", centroid.state)
+            print("Feat: ", centroid.feats)
+            print("Covs: ", centroid.covs)
+            print("Weight: ", centroid.weight)
             for p in P_prev_t:
                 x,y,_=p.state
                 ax.scatter(x, y, c='r', marker='.')
-        # for c in centroids_logged:
-        #     plt.scatter(c[1],c[3], c='k', marker='*')
-        # gps_estimates[:, t] = np.array([x_gps, y_gps])
-        # plt.pause(0.00001)
-        # ax.clear()
-        gps_estimates[:,t] = np.array([x_gps, y_gps])
 
         if (PRINTING):
             print("Time Step: %d", t)
@@ -624,7 +610,7 @@ def main():
 
         # Prediction Step
         P_pred_t,  w_tot = prediction_step(P_prev_t, u_t, z_t)
-
+        
         # Correction Step
         P_t = correction_step(P_pred_t, w_tot)
 

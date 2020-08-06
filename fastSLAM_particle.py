@@ -1,14 +1,16 @@
 import numpy as np
 
 class Particle:
-	"""A particle class for a fastSLAM implementation. Right now map only has one feature
-		Member variables
+	"""A particle class for a FastSLAM 1.0 implementation. Right now map only has one feature
+		
+		Member variables:
 		state (np.array)	--The pose of the particle (x,y,theta)
 		feats (np.array)	--The means of the landmarks
 		cov	  (np.array)	--The covariances of the landmarks
+		weight(float)		--The importance weight of the particle
 	"""
 	def __init__(self):
-		"""Instantiate a particle whose state will always be pose"""
+		"""Instantiate a particle whose state will be pose"""
 		self.state = np.empty([3,1], dtype=np.double)
 		# ID and Location of feature in cartesian coordinate system
 		self.feats = np.empty([3,1], dtype=np.double)
@@ -22,7 +24,7 @@ class Particle:
 		# Location of feature in cartesian coordinate system
 		self.feats = np.array([0,0,0], dtype=np.double)
 		# Array of 2x2 covariances
-		self.covs = np.empty([2,2,1], dtype=np.double)
+		self.covs = np.empty([2,2], dtype=np.double)
 		# Particle weight
 		self.weight = wt
 
@@ -40,10 +42,11 @@ class Particle:
 			observed (bool)
 		"""
 		
-		if(self.feat[0]==featID):
-			return true
+		if(self.feats[0]==featID):
+			#print(self.feats[0])
+			return True
 
-		return false
+		return False
 
 	def initFeat(self, featID, mu, cov, w):
 		"""Initialize a feature's mean, covariance and weight
@@ -55,9 +58,9 @@ class Particle:
 		"""
 
 		# Can keep simple, since we know only one feature
-		self.feat[0]=featID
-		self.feat[1]=mu[0]
-		self.feat[2]=mu[1]
+		self.feats[0]=featID
+		self.feats[1]=mu[0]
+		self.feats[2]=mu[1]
 		self.cov=cov
 		self.weight=w
 
@@ -70,7 +73,7 @@ class Particle:
 		"""
 
 		# Can keep simple, since we know only one feature
-		self.feat[1]=mu[0]
-		self.feat[2]=mu[1]
+		self.feats[1]=mu[0]
+		self.feats[2]=mu[1]
 		self.cov=cov
 		self.weight=w
