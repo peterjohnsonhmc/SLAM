@@ -61,7 +61,7 @@ class Particle:
 		self.feats[0]=featID
 		self.feats[1]=mu[0]
 		self.feats[2]=mu[1]
-		self.cov=cov
+		self.covs=cov
 		self.weight=w
 
 	def updateFeat(self, featID, mu, cov, w):
@@ -75,5 +75,5 @@ class Particle:
 		# Can keep simple, since we know only one feature
 		self.feats[1]=mu[0]
 		self.feats[2]=mu[1]
-		self.cov=cov
+		self.covs=cov
 		self.weight=w

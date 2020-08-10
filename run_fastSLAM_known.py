@@ -31,30 +31,49 @@ HEIGHT_THRESHOLD = 0.0                  # meters
 GROUND_HEIGHT_THRESHOLD = -.4           # meters
 dt = 0.1                                # timestep seconds
 EARTH_RADIUS = 6.3781E6                 # meters
-NUM_PARTICLES = 1000                                     # 100 isnt quite good enough
+NUM_PARTICLES = 100                                    # 100 isnt quite good enough
 # variances obtained from previous work with Accelerometer and LiDAR
 VAR_THETA = 0.00058709
 VAR_LIDAR = 0.0075**2 # this is actually range but works for x and y
+VAR_MOTION = 9.18E-6
+VAR_YAW = 5.8709E-4
+
 # Covariance matrices to be computed once, ahead of tie
+# Motion covariance
+R_t = np.array([[VAR_MOTION,0,0],
+                [0,VAR_MOTION,0],
+                [0,0,VAR_YAW]],dtype=np.double)
+
+R_t_inv = np.linalg.inv(R_t)
+
 # Measurment covariance
 Q_t = np.array([[VAR_LIDAR, 0],
                [0,  VAR_LIDAR]],dtype=np.double)
 
-# Measurment covariance reltive to landmark state
-H = np.array([[ -1.0, 0],
-              [  0,-1.0]],dtype = np.double)
+# Measurment function jacobian reltive to state
+H_x = np.array([[ -1.0, 0, 0],
+                [  0,-1.0, 0]],dtype = np.double)
 
-H_T = np.transpose(H)
+H_x_T = np.transpose(H_x)
 
-H_inv = np.linalg.inv(H)
-H_inv_T = np.transpose(H_inv)
-feat_init_cov = H_inv.dot(Q_t).dot(H_inv_T)
+
+# Measurment function jacobian relative to map
+H_m = np.array([[ 1.0, 0],
+                [ 0, 1.0]],dtype = np.double)
+
+H_m_T = np.transpose(H_m)
+
+H_m_inv = np.linalg.inv(H_m)
+H_m_inv_T = np.transpose(H_m_inv)
+feat_init_cov = H_m_inv_T.dot(Q_t).dot(H_m_inv)
+
+# Measurment function jacobian relative
 # Default importance weight
 p0 = 1/NUM_PARTICLES
 
 PRINTING = False
 
-global V
+global V #0.491 m/s
 
 
 def load_data(filename):
@@ -202,14 +221,13 @@ def propagate_state(p_i_t, u_t):
         u_t (np.array)       -- the current control input (really is odometry)
 
         Returns:
-        p_i_t (particle)  -- the predicted particle
+        x_hat_t (np.array)  -- the propagated state
     """
     #Destructure arrays
     x, y, theta = p_i_t.state
     #w = p_i_t.weight
     ux, uy, yaw = u_t
 
-    # print("V: ", V  )
     Vel = V* np.random.uniform(0.89, 1.1)
     if (Vel < 0.9*V):
         Vel = 0 + np.random.normal(0,0.05)
@@ -221,18 +239,14 @@ def propagate_state(p_i_t, u_t):
     Vy = Vel*math.sin(yaw)
 
     p_i_t.updateState(x+Vx*dt,y+Vy*dt,yaw)
-    #print("p_i_t.state: ", p_i_t.state)
-    #print("p_i_t.feats: ", p_i_t.feats)
-    #print("p_i_t.covs: ", p_i_t.covs)
-    #print("p_i_t.weight: ", p_i_t.weight)
 
     return p_i_t
 
-def calc_inverse_Sensor(p_i_t,z_t):
+def calc_inverse_Sensor(p_i_t,z_g_t):
     """Calculate the location of a feature given the measurment
-        and the pose
+        and the pose. 
         Parameters:
-        z_t (np.array)  --measurment
+        z_g_t (np.array)  --measurment in global frame orientation
         x_t (np.array)  --pose
 
         Returns:
@@ -240,7 +254,7 @@ def calc_inverse_Sensor(p_i_t,z_t):
     """
 
     x, y, theta = p_i_t.state
-    z_x, z_y = z_t
+    z_x, z_y = z_g_t
 
     mu_t = np.array([x+z_x,
                      y+z_y],
@@ -259,12 +273,10 @@ def calc_meas_prediction(p_i_t):
     """
     x, y, theta = p_i_t.state
 
+    # Orientation will not matter
     z_bar_t = np.array([p_i_t.feats[1]-x,
                         p_i_t.feats[2]-y],
                         dtype = np.double)
-
-    #print("z_bar_t: ", z_bar_t.shape)
-    #print("z_bar_t: ", z_bar_t)
 
     return z_bar_t
 
@@ -308,45 +320,69 @@ def prediction_step(P_prev, u_t, z_t):
 
     # loop over all of the previous particles
     for p_prev in P_prev:
-        # find new state given previous particle, odometry + randomness (motion model)
-        p_pred = propagate_state(p_prev, u_t)
-        #print("propagated")
-        
+        # predict pose given previous particle, odometry + randomness (motion model)
+        p_pred_t = propagate_state(p_prev, u_t)
+        #print("Pred State: ", p_pred_t.state)
         # Mapping with observed feature
         # Globalize the measurment for each particle
-        z_g_t = local_to_global(p_pred, z_t)
-        if(p_pred.observed(c_t)==True):
-            #print("Previously observed feature")
+        z_g_t = local_to_global(p_pred_t, z_t)
+        #print("Map frame z: ", z_g_t)
+        # measurement prediction
+        z_bar_t = calc_meas_prediction(p_pred_t)
+        #print("z_bar_t: ", z_bar_t)
+        # measurment information 
+        Q_j = Q_t+H_m.dot(p_pred_t.covs).dot(H_m_T)
+        #print("Q_j: ", Q_j)
+        Q_j_inv = np.linalg.inv(Q_j)
+        #print("Q_j_inv: ", Q_j_inv)
+        # Cov of proposal distribution
+        sigma_x_j = np.linalg.inv(H_x_T.dot(Q_j_inv).dot(H_x)+R_t_inv)
+        #print("sigma_x_j: ", sigma_x_j)
+        # Mean of proposal distribution
+        mu_x_j = sigma_x_j.dot(H_x_T).dot(Q_j_inv).dot(z_g_t-z_bar_t)+p_pred_t.state
+        #print("mu_x_j: ", mu_x_j, mu_x_j.shape) 
+        # Sample pose
+        x_t = np.random.multivariate_normal(mu_x_j,sigma_x_j,1)
+        #print("x_t: ", x_t, x_t.shape)
+        #print(x_t[0,0], x_t[0,1], x_t[0,2])
+        p_pred_t.updateState(x_t[0,0], x_t[0,1], x_t[0,2])
+        # Predict measurment for sampled pose
+        z_hat_t = calc_meas_prediction(p_pred_t)
+        
+
+        if(p_pred_t.observed(c_t)==True):
             
-            # measurement prediction
-            z_bar_t = calc_meas_prediction(p_pred)
-            # measurment covariance
-            Q = H.dot(p_pred.covs).dot(H_T)+Q_t
-            Q_inv = np.linalg.inv(Q)
             # Kalman gain
-            K = p_pred.covs.dot(H_T).dot(Q_inv)
+            K = p_pred_t.covs.dot(H_m_T).dot(Q_j_inv)
             # update mean
-            mu = p_pred.feats[1:2]+K.dot(z_g_t-z_bar_t)
-            # update covariance
-            cov = (np.identity(2)-K.dot(H)).dot(p_pred.cov)
+            #print("feats: ", p_pred_t.feats[1:2])
+            # np.array slicing is not inclusive of last index
+            mu = p_pred_t.feats[1:3]+K.dot(z_g_t-z_hat_t)
+            #print("mu: ", mu)
+            # update map covariance
+            sigma_j = (np.identity(2)-K.dot(H_m)).dot(p_pred_t.covs)
             # importance factor
-            importance = multivariate_normal(z_bar_t,cov)
+            L = H_x.dot(R_t).dot(H_x_T)+H_m.dot(p_pred_t.covs).dot(H_m_T)+Q_t
+            importance = multivariate_normal(z_hat_t,L)
             weight = importance.pdf(z_g_t)
-            print("Weight: ",weight)
-            p_pred.updateFeat(c_t, mu, cov, weight)
+            #print("Weight: ",weight)
+            p_pred_t.updateFeat(c_t, mu, sigma_j, weight)
 
         else: # Never seen before
             #print("New observed feature")
-            mu = calc_inverse_Sensor(p_pred,z_g_t)
-            p_pred.initFeat(c_t, mu, feat_init_cov,p0) 
+            mu = calc_inverse_Sensor(p_pred_t,z_g_t)
+            p_pred_t.initFeat(c_t, mu, feat_init_cov,p0) 
 
+        # We always see the one feature, no need for a case with negative information
         
         # find particle's weight using wt = P(zt | xt)
-        w_t = p_pred.weight
+        w_t = p_pred_t.weight
         w_tot += w_t
         # add new particle to the current belief
-        p_pred.weight = w_t
-        P_pred.append(p_pred)
+        P_pred.append(p_pred_t)
+        #print("State: ", p_pred_t.state)
+        #print("Feat: ", p_pred_t.feats)
+        #print("Weight: ", w_t)
 
     return [P_pred, w_tot]
 
@@ -500,7 +536,7 @@ def find_sigma(data_set):
 def main():
     """Run FastSLAM on logged data from IMU and LiDAR moving in a box formation around a landmark"""
 
-    np.random.seed(28)
+    #np.random.seed(28)
 
     filepath = ""
     filename =  "2020_2_26__16_59_7" #"2020_2_26__17_21_59"
@@ -536,7 +572,7 @@ def main():
     #Compute avg velocity for use in motion model
     global V
     V = 4*10/(len(time_stamps)*dt)
-    #print("V: ", V)
+    print("V: ", V)
 
 
     #  Initialize filter
@@ -563,7 +599,7 @@ def main():
     #Initialize animated plot
     plt.figure(1)
     fig, ax = plt.subplots(subplot_kw={'aspect': 'equal'})
-    plt.axis([-5, 15, -17, 3])
+    plt.axis([-15, 15, -17, 15])
     ax.set_ylabel("Y position (Global Frame, m)")
     ax.set_xlabel("X position (Global Frame, m)")
     ax.legend(["Expected Path", "Estimated Position", "GPS Position"], loc='center right')
@@ -585,7 +621,10 @@ def main():
         centroids_logged[:,t] = centroid.state.reshape((3,))
         wt_logged[t]=centroid.weight
         # Print all particles
-        if (t % 50 == 1):
+        if ( t>0):
+            print("Feat: ", centroid.feats)
+        
+        if (t % 50 == 0):
             print("State: ", centroid.state)
             print("Feat: ", centroid.feats)
             print("Covs: ", centroid.covs)
