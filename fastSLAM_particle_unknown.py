@@ -4,6 +4,7 @@ import numpy as np
 class Particle:
     """A particle class for a FastSLAM 2.0 implementation with unknown data correspondence. 
         Map can have unlimited features
+        Could make a landmark class, but np.arrays are fine
         
         Member variables:
         state (np.array)    --The pose of the particle (x,y,theta)
@@ -26,7 +27,12 @@ class Particle:
         self.weight = wt
 
     def updateState(self, x,y,theta):
-        """Update the state of the particle"""
+        """Update the state of the particle
+            Parameters:
+            x       (float)     -- x coordinate
+            y       (float)     -- y coordinate
+            theta   (float)     -- yaw angle
+        """
         self.state[0]=x
         self.state[1]=y
         self.state[2]=theta
@@ -68,7 +74,7 @@ class Particle:
             cov (np.array)  --covariance matrix
             w (float)       --importance weight of the particle
         """
-        # change to indexing from 0
+        # change to indexing from 0 instead of 1
         featID-=1
         self.feats[0,featID]=mu[0]
         self.feats[1,featID]=mu[1]

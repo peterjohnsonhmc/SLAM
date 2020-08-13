@@ -19,6 +19,7 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 import math
+import copy
 import os.path
 import scipy as sp
 from scipy.stats import norm, uniform, multivariate_normal
@@ -30,13 +31,23 @@ HEIGHT_THRESHOLD = 0.0                  # meters
 GROUND_HEIGHT_THRESHOLD = -.4           # meters
 dt = 0.1                                # timestep seconds
 EARTH_RADIUS = 6.3781E6                 # meters
-NUM_PARTICLES = 10                                   # 100 isnt quite good enough
+  
+global V #0.491 m/s                              # 100 isnt quite good enough
 # variances obtained from previous work with Accelerometer and LiDAR
 VAR_THETA = 0.00058709
 VAR_LIDAR = 0.0075**2 # 0.0075 is true, but want to accomodate post
 VAR_MOTION = 9.18E-6
 VAR_YAW = 5.8709E-4
 POST_RAD = 0.05 # 0.1 m
+
+
+NUM_PARTICLES = 10   
+# Default importance weight, perhaps consider tuning
+#p0 = 1/NUM_PARTICLES
+p0 =1e-100
+
+PRINTING = False
+
 
 # Covariance matrices to be computed once, ahead of tie
 # Motion covariance
@@ -50,7 +61,7 @@ R_t_inv = np.linalg.inv(R_t)
 Q_t = np.array([[VAR_LIDAR, 0],
                [0,  VAR_LIDAR]],dtype=np.double)
 
-# Measurment function jacobian reltive to state
+# Measurment function jacobian relative to state
 H_x = np.array([[ -1.0, 0, 0],
                 [  0,-1.0, 0]],dtype = np.double)
 
@@ -67,13 +78,6 @@ H_m_inv = np.linalg.inv(H_m)
 H_m_inv_T = np.transpose(H_m_inv)
 feat_init_cov = H_m_inv_T.dot(Q_t).dot(H_m_inv)
 
-# Measurment function jacobian relative
-# Default importance weight
-p0 = 1/NUM_PARTICLES
-
-PRINTING = False
-
-global V #0.491 m/s
 
 
 def load_data(filename):
@@ -331,6 +335,7 @@ def calc_proposal_feat(p_prev, u_t, z_t):
     Q_j_inverse = np.empty([2,2]) # doesn't matter
     z_pred = np.empty([2,1]) # doesn't matter
     # start at 1, include N
+    print("N: ", p_prev.N)
     for j in range(1,p_prev.N+1):
         # predict pose given previous particle, odometry + randomness (motion model)
         x_hat_t = propagate_state(p_prev.state, u_t)
@@ -355,6 +360,8 @@ def calc_proposal_feat(p_prev, u_t, z_t):
         # Correspendence likelihood
         correspondence_dist = multivariate_normal(z_hat_t, Q_j)
         pi_j = correspondence_dist.pdf(z_g_t)
+        #print("Likelihood: ", pi_j)
+        # Have an issue with pi_j vs likelihood of new feature
 
         if(pi_j>max_L):
             max_L=pi_j
@@ -395,7 +402,7 @@ def update_EKFs(p_prev, c_hat, x_t_j, Q_j_inv,z_hat_t, u_t, z_t):
         p_pred  (particle)          -- the predicted particle 
     """
     x_t = p_prev.state
-    p_pred = p_prev
+    p_pred = copy.copy(p_prev)
 
     # Loop through all features in reverse
     # Removal from the end will not impact lower indices
@@ -404,7 +411,7 @@ def update_EKFs(p_prev, c_hat, x_t_j, Q_j_inv,z_hat_t, u_t, z_t):
         
         # is new feature?
         if(j==c_hat and c_hat ==p_prev.N):
-            print("New observed feature")
+            #print("New observed feature")
             
             # sample pose 
             x_t = propagate_state(p_prev.state, u_t)
@@ -415,7 +422,7 @@ def update_EKFs(p_prev, c_hat, x_t_j, Q_j_inv,z_hat_t, u_t, z_t):
             
         # is observed feature?
         elif (j==c_hat and c_hat < p_prev.N):
-            print("previously observed")
+            #print("previously observed")
             # use pose from proposal distribution
             x_t = x_t_j
             # globalize measurment from that frame
@@ -433,12 +440,12 @@ def update_EKFs(p_prev, c_hat, x_t_j, Q_j_inv,z_hat_t, u_t, z_t):
             L = H_x.dot(R_t).dot(H_x_T)+H_m.dot(p_pred.getCov(j)).dot(H_m_T)+Q_t
             importance_dist = multivariate_normal(z_hat_t,L)
             weight = importance_dist.pdf(z_g_t)
-            #print("Importance Weight: ",weight)
+            print("Importance Weight: ",weight)
             p_pred.updateFeat(c_hat, mu, sigma_j, weight)
 
         # all other features
         else:
-            print("not observed")
+            #print("not observed")
             mu_prev = p_pred.getFeat(j)
             # should feature have been seen?
             if (in_range(p_pred.state, mu_prev)):
@@ -449,7 +456,16 @@ def update_EKFs(p_prev, c_hat, x_t_j, Q_j_inv,z_hat_t, u_t, z_t):
     
     # remember to update the state of the particle
     p_pred.updateState(x_t[0], x_t[1], x_t[2])
+    #print(np.double(p_prev.state[0])-np.double(p_pred.state[0]))
+    if (abs(p_prev.state[0]-p_pred.state[0]) > 0.00000125):
+        print("prev State: ", p_prev.state)
+        print("prev Feats: ", p_prev.feats)
+        print("prev Weight: ", p_prev.weight)
+        print("Pred State: ", p_pred.state)
+        print("Pred Feats: ", p_pred.feats)
+        print("Pred Weight: ", p_pred.weight)
 
+    
     return p_pred
 
 
@@ -507,18 +523,18 @@ def correction_step(P_pred, w_tot):
 
     # different from the global p0
     p0 = P_pred[0]
-    w0 = p0.weight 
+    w0 = copy.copy(p0.weight) 
     # resampling algorithm
     for p in P_pred:
         r = np.random.uniform(0, 1)*w_tot
         j = 0
-        wsum = w0
+        wsum = copy.copy(w0)
         while (wsum < r):
             j += 1
             if (j == NUM_PARTICLES-1):
                 break
             p_j = P_pred[j]
-            w_j = p_j.weight
+            w_j = copy.copy(p_j.weight)
             wsum += w_j
 
         p_c = P_pred[j]
@@ -696,7 +712,7 @@ def main():
     #Initialize animated plot
     plt.figure(1)
     fig, ax = plt.subplots(subplot_kw={'aspect': 'equal'})
-    plt.axis([-15, 15, -17, 15])
+    plt.axis([-15, 50, -50, 15])
     ax.set_ylabel("Y position (Global Frame, m)")
     ax.set_xlabel("X position (Global Frame, m)")
     ax.legend(["Expected Path", "Estimated Position", "GPS Position"], loc='center right')
@@ -718,10 +734,10 @@ def main():
         centroids_logged[:,t] = centroid.state.reshape((3,))
         wt_logged[t]=centroid.weight
         # Print all particles
-        if ( t>0):
-            print("State: ", centroid.state)
-            print("Feat: ", centroid.feats)
-            print("Weight: ", centroid.weight)
+        #if ( t>0):
+            #print("State: ", centroid.state)
+            #print("Feat: ", centroid.feats)
+            #print("Weight: ", centroid.weight)
         
         if (t % 50 == 0):
             print("State: ", centroid.state)
