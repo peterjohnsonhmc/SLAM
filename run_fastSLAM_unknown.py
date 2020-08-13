@@ -30,12 +30,13 @@ HEIGHT_THRESHOLD = 0.0                  # meters
 GROUND_HEIGHT_THRESHOLD = -.4           # meters
 dt = 0.1                                # timestep seconds
 EARTH_RADIUS = 6.3781E6                 # meters
-NUM_PARTICLES = 100                                    # 100 isnt quite good enough
+NUM_PARTICLES = 10                                   # 100 isnt quite good enough
 # variances obtained from previous work with Accelerometer and LiDAR
 VAR_THETA = 0.00058709
-VAR_LIDAR = 0.0075**2 # this is actually range but works for x and y
+VAR_LIDAR = 0.0075**2 # 0.0075 is true, but want to accomodate post
 VAR_MOTION = 9.18E-6
 VAR_YAW = 5.8709E-4
+POST_RAD = 0.05 # 0.1 m
 
 # Covariance matrices to be computed once, ahead of tie
 # Motion covariance
@@ -246,7 +247,7 @@ def propagate_state(x_t_prev, u_t):
 
 def calc_inverse_Sensor(x_t,z_g_t):
     """Calculate the location of a feature given the measurment
-        and the pose. 
+        and the pose. Include the radius of the post
         Parameters:
         z_g_t (np.array)     --measurment in global frame orientation
         x_t (np.array)  --pose
@@ -258,8 +259,8 @@ def calc_inverse_Sensor(x_t,z_g_t):
     x, y, theta = x_t
     z_x, z_y = z_g_t
 
-    mu_t = np.array([x+z_x,
-                     y+z_y],
+    mu_t = np.array([x+z_x+POST_RAD,
+                     y+z_y+POST_RAD],
                     dtype = np.double)
     return mu_t
 
@@ -278,11 +279,10 @@ def calc_meas_prediction(x_t, mu):
     """
 
     x, y, theta = x_t
-
     mu_x, mu_y = mu
     
-    z_bar_t = np.array([mu_x-x,
-                        mu_y-y],
+    z_bar_t = np.array([mu_x-POST_RAD-x,
+                        mu_y-POST_RAD-y],
                         dtype = np.double)
     return z_bar_t
 
@@ -320,13 +320,18 @@ def calc_proposal_feat(p_prev, u_t, z_t):
         Returns:
         x_t_j  (np.array)      -- sample pose from proposal distribution
         c_hat    (int)         -- the featID of the most likely feat  
+        Q_j_inv (np.array)     -- the measurment information matrix inverse
+        z_pred (np.array)      -- measurement prediction from proposal dist sample 
     """
     # Loop through all landmarks, find most likely landmark
-    # Likelihood of a new feature
+    # Initialize for Likelihood of a new feature
     max_L=p0
-    x_t_j = p_prev.state
-    c_hat = p+prev.N+1
-    for j in range(p_prev.N):
+    x_t_j = p_prev.state # doesn't matter
+    c_hat = p_prev.N+1
+    Q_j_inverse = np.empty([2,2]) # doesn't matter
+    z_pred = np.empty([2,1]) # doesn't matter
+    # start at 1, include N
+    for j in range(1,p_prev.N+1):
         # predict pose given previous particle, odometry + randomness (motion model)
         x_hat_t = propagate_state(p_prev.state, u_t)
         # Globalize the measurment for each particle
@@ -336,26 +341,30 @@ def calc_proposal_feat(p_prev, u_t, z_t):
         # measurement prediction
         z_bar_t = calc_meas_prediction(x_hat_t,mu)
         # measurment information 
-        Q_j = Q_t+H_m.dot(p_pred_t.covs[,,j]).dot(H_m_T)
+        Q_j = Q_t+H_m.dot(p_prev.getCov(j)).dot(H_m_T)
         Q_j_inv = np.linalg.inv(Q_j)
         # Cov of proposal distribution
         sigma_x_j = np.linalg.inv(H_x_T.dot(Q_j_inv).dot(H_x)+R_t_inv)
         # Mean of proposal distribution
-        mu_x_j = sigma_x_j.dot(H_x_T).dot(Q_j_inv).dot(z_g_t-z_bar_t)+p_pred_t.state
+        mu_x_j = sigma_x_j.dot(H_x_T).dot(Q_j_inv).dot(z_g_t-z_bar_t)+x_hat_t
         # Sample pose
         x_t = np.random.multivariate_normal(mu_x_j,sigma_x_j,1)
+        x_t=x_t[0] # formatting issue
         # Predict measurment for sampled pose
         z_hat_t = calc_meas_prediction(x_t,mu)
         # Correspendence likelihood
         correspondence_dist = multivariate_normal(z_hat_t, Q_j)
         pi_j = correspondence_dist.pdf(z_g_t)
 
-        if(pi_j>maxL):
+        if(pi_j>max_L):
             max_L=pi_j
             c_hat = j
             x_t_j = x_t
+            Q_j_inverse = Q_j_inv
+            z_pred = z_hat_t
 
-    return [c_hat, x_t_j]
+    #print("c_hat: ",c_hat)
+    return [c_hat, x_t_j, Q_j_inverse, z_pred]
 
 def in_range(x_t, mu):
     """Check if a feature is in perceptual range of a sensor
@@ -371,7 +380,7 @@ def in_range(x_t, mu):
     # In other cases, might have to do something mroe complicated
     return True
 
-def update_EKFs(p_prev, c_hat, x_t_j, u_t, z_t):
+def update_EKFs(p_prev, c_hat, x_t_j, Q_j_inv,z_hat_t, u_t, z_t):
     """Update the landmark EKFs of the particle based on the correspondence
 
         Parameters:
@@ -379,47 +388,57 @@ def update_EKFs(p_prev, c_hat, x_t_j, u_t, z_t):
         u_t (np.array)              -- the control input
         z_t (np.array)              -- the measurement
         c_hat (int)                 -- correspondence variable
+        Q_j_inv (np.array)          -- measurment information matrix inverse
+        z_hat_t (np.array)          -- predicted measurment from proposal sample
 
         Returns:
         p_pred  (particle)          -- the predicted particle 
     """
+    x_t = p_prev.state
     p_pred = p_prev
 
-    # Loop through all features
-    for j in range(p_prev.N):
+    # Loop through all features in reverse
+    # Removal from the end will not impact lower indices
+    # Loop from N to 1
+    for j in range(p_prev.N,0,-1):
         
         # is new feature?
         if(j==c_hat and c_hat ==p_prev.N):
-            #print("New observed feature")
+            print("New observed feature")
             
             # sample pose 
-            x_t = propagate_state(p_prev.state, u_t):
+            x_t = propagate_state(p_prev.state, u_t)
             # initialize mean
+            z_g_t = local_to_global(x_t, z_t)
             mu = calc_inverse_Sensor(x_t,z_g_t)
             p_pred.initFeat(c_hat, mu, feat_init_cov,p0) 
             
         # is observed feature?
-        else if (j==c_hat and c_hat < p_prev.N):
+        elif (j==c_hat and c_hat < p_prev.N):
+            print("previously observed")
             # use pose from proposal distribution
             x_t = x_t_j
+            # globalize measurment from that frame
+            z_g_t = local_to_global(x_t, z_t)
             # calc Kalman gain
-            K = p_pred_t.covs[,,j].dot(H_m_T).dot(Q_j_inv)
+            K = p_pred.getCov(j).dot(H_m_T).dot(Q_j_inv)
             # update mean
             #print("feats: ", p_pred_t.feats[1:2])
             # np.array slicing is not inclusive of last index
             mu = p_pred.getFeat(j)+K.dot(z_g_t-z_hat_t)
             #print("mu: ", mu)
             # update map covariance
-            sigma_j = (np.identity(2)-K.dot(H_m)).dot(p_pred_t.covs[,,j])
+            sigma_j = (np.identity(2)-K.dot(H_m)).dot(p_pred.getCov(j))
             # importance weight
-            L = H_x.dot(R_t).dot(H_x_T)+H_m.dot(p_pred_t.covs[,,j]).dot(H_m_T)+Q_t
+            L = H_x.dot(R_t).dot(H_x_T)+H_m.dot(p_pred.getCov(j)).dot(H_m_T)+Q_t
             importance_dist = multivariate_normal(z_hat_t,L)
             weight = importance_dist.pdf(z_g_t)
-            #print("Weight: ",weight)
-            p_pred_t.updateFeat(c_t, mu, sigma_j, weight)
+            #print("Importance Weight: ",weight)
+            p_pred.updateFeat(c_hat, mu, sigma_j, weight)
 
         # all other features
         else:
+            print("not observed")
             mu_prev = p_pred.getFeat(j)
             # should feature have been seen?
             if (in_range(p_pred.state, mu_prev)):
@@ -427,6 +446,9 @@ def update_EKFs(p_prev, c_hat, x_t_j, u_t, z_t):
                 p_pred.decrementFeat(j)
             #else:
                 # no, do not change
+    
+    # remember to update the state of the particle
+    p_pred.updateState(x_t[0], x_t[1], x_t[2])
 
     return p_pred
 
@@ -449,15 +471,15 @@ def prediction_step(P_prev, u_t, z_t):
     # loop over all of the previous particles
     for p_prev in P_prev:
         # find proposal and corresponding feature
-        c_hat, x_t_j = calc_proposal_feat(p_prev, u_t, z_t)
+        c_hat, x_t_j, Q_j_inv, z_hat_t = calc_proposal_feat(p_prev, u_t, z_t)
         # new number of features
         p_prev.N = max(p_prev.N, c_hat)
         # update landmark Kalman Filters
-        p_pred = update_EKFs(p_prev, c_hat, x_t_j, u_t, z_t)
+        p_pred = update_EKFs(p_prev, c_hat, x_t_j, Q_j_inv, z_hat_t, u_t, z_t)
         # record weight
         w_tot += p_pred.weight
         # add new particle to the current belief
-        P_pred.append(p_pred_t)
+        P_pred.append(p_pred)
         #print("State: ", p_pred_t.state)
         #print("Feat: ", p_pred_t.feats)
         #print("Weight: ", w_t)
@@ -615,7 +637,7 @@ def find_sigma(data_set):
 def main():
     """Run FastSLAM on logged data from IMU and LiDAR moving in a box formation around a landmark"""
 
-    #np.random.seed(28)
+    np.random.seed(28)
 
     filepath = ""
     filename =  "2020_2_26__16_59_7" #"2020_2_26__17_21_59"
@@ -642,8 +664,6 @@ def main():
     # Find variances by looking at a constant measurement
     VAR_AX = find_sigma(x_ddot[0:79])**2
     VAR_AY = find_sigma(y_ddot[0:79])**2
-    # print(VAR_AX)
-    # print(VAR_AY)
 
     lat_origin = lat_gps[0]
     lon_origin = lon_gps[0]
@@ -651,8 +671,6 @@ def main():
     #Compute avg velocity for use in motion model
     global V
     V = 4*10/(len(time_stamps)*dt)
-    print("V: ", V)
-
 
     #  Initialize filter
     P_prev_t = []
@@ -666,7 +684,7 @@ def main():
         p = Particle(0,0,0,1/NUM_PARTICLES)
         P_prev_t.append(p)
 
-    #allocate
+    # allocate memory
     gps_estimates = np.empty((2, len(time_stamps)))
     centroids_logged = np.empty((3, len(time_stamps)))
     wt_logged = np.empty((len(time_stamps)))
@@ -701,7 +719,9 @@ def main():
         wt_logged[t]=centroid.weight
         # Print all particles
         if ( t>0):
+            print("State: ", centroid.state)
             print("Feat: ", centroid.feats)
+            print("Weight: ", centroid.weight)
         
         if (t % 50 == 0):
             print("State: ", centroid.state)
